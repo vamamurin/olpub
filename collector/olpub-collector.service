@@ -1,0 +1,44 @@
+[Unit]
+Description=olpub collector (đẩy PDF đã biên dịch từ Overleaf sang VM 1007)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=olpub-collector
+Group=olpub-collector
+EnvironmentFile=/etc/olpub/collector.env
+ExecStart=/usr/bin/python3 /opt/olpub/olpub_collector.py
+Restart=always
+RestartSec=5
+
+# Đọc được thư mục data của Overleaf (file thuộc uid www-data trong container)
+# mà KHÔNG chạy bằng root: chỉ cấp quyền vượt kiểm tra ĐỌC, không có quyền ghi.
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+
+# Chỉ được nói chuyện với publisher
+IPAddressDeny=any
+IPAddressAllow=10.0.30.57
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
