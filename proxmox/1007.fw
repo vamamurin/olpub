@@ -1,0 +1,20 @@
+# /etc/pve/firewall/1007.fw — VM 1007 host-publish (olpub 1.1)
+# Proxmox Firewall có trạng thái (stateful): gói trả lời cho kết nối IN đã chấp nhận tự được cho qua,
+# nên policy_out DROP không chặn Nginx VM 100 / collector nhận phản hồi.
+# Dòng bắt đầu bằng "|" là rule đang TẮT (cú pháp của Proxmox, bật/tắt được trong GUI).
+
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: DROP
+
+[RULES]
+IN ACCEPT -source 10.0.10.12 -p tcp -dport 8080 # Nginx VM100 -> Nginx tinh (read.tapama.cloud)
+IN ACCEPT -source 10.0.10.12 -p tcp -dport 8082 # Nginx VM100 -> olpub ADMIN (overleaf/_pub/)
+IN ACCEPT -source 10.0.30.56 -p tcp -dport 8081 # collector VM1006 -> olpub INTERNAL
+IN ACCEPT -source 10.0.10.13 -p tcp -dport 22 # Guacamole SSH, nhu cac tenant khac
+OUT ACCEPT -dest 10.0.30.1 -p udp -dport 53 # DNS -> pfSense
+OUT ACCEPT -dest 10.0.30.1 -p tcp -dport 53 # DNS -> pfSense
+OUT ACCEPT -dest 10.0.30.1 -p udp -dport 123 # NTP -> pfSense (can rule pfSense tuong ung)
+OUT ACCEPT -dest 10.0.20.10 -p tcp -dport 1514:1515 # Wazuh agent
+|OUT ACCEPT -p tcp -dport 80,443 # apt update - CHI BAT TAM khi cap nhat goi, xong TAT lai

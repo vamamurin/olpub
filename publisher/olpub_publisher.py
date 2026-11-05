@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""olpub-publisher — trang publish PDF cho Overleaf CE (VM 1007 host-publish).
+"""olpub-publisher 1.1 — publish PDF cho Overleaf CE (VM 1007 host-publish).
 
-Ba listener, tách cổng để Nginx không thể nhầm luồng:
-  PUBLIC   :8080  read.tapama.cloud            — chỉ GET/HEAD, ai cũng xem được
+Từ bản 1.1, Python KHÔNG còn trả lời người xem. Publisher sinh sẵn file tĩnh vào
+OLPUB_WWW_DIR; Nginx trên chính VM 1007 phục vụ thư mục đó ở cổng 8080.
+
+Hai listener Python còn lại, đều không mở cho người lạ:
   ADMIN    :8082  overleaf.tapama.cloud/_pub/  — sau mTLS + Authelia, Nginx gắn X-Pub-User / X-Pub-Device
   INTERNAL :8081  collector trên VM 1006       — Bearer token, nhận PDF/TeX đã biên dịch
 
 Chỉ dùng thư viện chuẩn Python (>= 3.11) + qpdf, exiftool, poppler-utils.
 """
+import base64
+import binascii
 import hashlib
 import hmac
 import html
@@ -23,10 +27,10 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
-from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------- cấu hình
 
@@ -36,10 +40,9 @@ def env(name, default):
 
 
 DATA_DIR = env("OLPUB_DATA_DIR", "/var/lib/olpub")
+WWW_DIR = env("OLPUB_WWW_DIR", "/srv/olpub/www")
 APP_DIR = env("OLPUB_APP_DIR", os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(APP_DIR, "static")
-PDFJS_DIR = env("OLPUB_PDFJS_DIR", "/opt/olpub/pdfjs")  # chứa build/ và web/ của bản dist
-PUBLIC_BIND = env("OLPUB_PUBLIC_BIND", "0.0.0.0:8080")
 ADMIN_BIND = env("OLPUB_ADMIN_BIND", "0.0.0.0:8082")
 INTERNAL_BIND = env("OLPUB_INTERNAL_BIND", "0.0.0.0:8081")
 PUBLIC_BASE_URL = env("OLPUB_PUBLIC_BASE_URL", "https://read.tapama.cloud").rstrip("/")
@@ -54,7 +57,7 @@ BLOCK_TRAINING_CRAWLERS = env("OLPUB_BLOCK_TRAINING_CRAWLERS", "1") == "1"
 TZ = timezone(timedelta(hours=7))  # Asia/Ho_Chi_Minh, không DST
 
 DB_PATH = os.path.join(DATA_DIR, "olpub.sqlite3")
-FILES_DIR = os.path.join(DATA_DIR, "files")
+FILES_DIR = os.path.join(DATA_DIR, "files")  # bản gốc đã làm sạch, theo project_id
 
 # Tên PDF bị từ chối: hành động tự chạy, file đính kèm, form gửi dữ liệu đi
 FORBIDDEN_PDF_NAMES = {
@@ -63,7 +66,8 @@ FORBIDDEN_PDF_NAMES = {
 }
 PID_RE = re.compile(r"^[0-9a-f]{24}$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,62}[a-z0-9]$")
-RESERVED_SLUGS = {"static", "pdfjs", "robots", "favicon", "_pub", "internal", "admin", "api", "index"}
+WWW_FILE_RE = re.compile(r"^([a-z0-9][a-z0-9-]{2,62}[a-z0-9])\.(html|pdf|txt|tex)$")
+RESERVED_SLUGS = {"static", "pdfjs", "robots", "favicon", "_pub", "internal", "admin", "api", "index", "read"}
 SLUG_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # bỏ i, l, o, 0, 1 cho dễ đọc
 
 log = logging.getLogger("olpub")
@@ -71,6 +75,7 @@ log = logging.getLogger("olpub")
 # ---------------------------------------------------------------- CSDL
 
 _db_lock = threading.Lock()
+_render_lock = threading.RLock()
 
 
 def db():
@@ -159,7 +164,7 @@ def remove_files(pid, which=("doc.pdf", "doc.txt", "doc.tex")):
             pass
 
 
-def atomic_write(path, data: bytes):
+def atomic_write(path, data: bytes, mode=0o640):
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
@@ -168,7 +173,7 @@ def atomic_write(path, data: bytes):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, 0o640)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -176,6 +181,11 @@ def atomic_write(path, data: bytes):
         except FileNotFoundError:
             pass
         raise
+
+
+def read_bytes(path, limit=None):
+    with open(path, "rb") as f:
+        return f.read(limit) if limit else f.read()
 
 
 # ---------------------------------------------------------------- làm sạch PDF
@@ -188,7 +198,7 @@ class RejectPDF(Exception):
 def _limits():
     resource.setrlimit(resource.RLIMIT_AS, (1536 * 1024 * 1024, 1536 * 1024 * 1024))
     resource.setrlimit(resource.RLIMIT_CPU, (60, 60))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_PDF_BYTES * 2, MAX_PDF_BYTES * 2))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (512 * 1024 * 1024, 512 * 1024 * 1024))
 
 
 def run(cmd, timeout=90, ok_codes=(0,)):
@@ -212,8 +222,110 @@ def _walk_names(node, found):
         found.add(node)
 
 
+# Phân đoạn JPEG chứa metadata: APP1 (EXIF — có thể có GPS, hãng/đời máy, thời điểm chụp;
+# XMP) và APP13 (Photoshop/IPTC). KHÔNG đụng APP0 (JFIF), APP2 (ICC — màu), APP14 (Adobe — màu).
+_JPEG_META = (
+    (0xE1, (b"Exif\x00\x00", b"http://ns.adobe.com/xap/1.0/\x00", b"http://ns.adobe.com/xmp/extension/\x00")),
+    (0xED, (b"Photoshop 3.0\x00",)),
+)
+
+
+def scrub_jpeg_metadata(buf: bytearray) -> int:
+    """Xóa trắng (ghi 0x00) phần dữ liệu của các phân đoạn metadata trong mọi ảnh JPEG
+    nằm trong buf. Giữ nguyên độ dài nên không làm lệch bảng xref của PDF; bộ giải mã
+    JPEG bỏ qua phân đoạn APPn không nhận ra. Trả về số phân đoạn đã xóa."""
+    count, i, n = 0, 0, len(buf)
+    while True:
+        i = buf.find(b"\xff\xd8\xff", i)
+        if i < 0:
+            return count
+        j = i + 2
+        while j + 4 <= n and buf[j] == 0xFF:
+            marker = buf[j + 1]
+            if marker == 0xFF:  # byte đệm
+                j += 1
+                continue
+            if marker == 0x01 or 0xD0 <= marker <= 0xD8:  # marker không có độ dài
+                j += 2
+                continue
+            if marker in (0xDA, 0xD9):  # SOS: phía sau là dữ liệu ảnh nén
+                break
+            seglen = (buf[j + 2] << 8) | buf[j + 3]
+            if seglen < 2 or j + 2 + seglen > n:
+                break
+            start, end = j + 4, j + 2 + seglen
+            for m, ids in _JPEG_META:
+                if marker == m and any(buf[start:start + len(x)] == x for x in ids):
+                    buf[start:end] = bytes(end - start)
+                    count += 1
+            j = end
+        i += 3
+
+
+def _undo_filter(name, data):
+    """Giải một lớp nén chung. Trả None nếu không hỗ trợ (giữ nguyên ảnh đó)."""
+    if name == "/FlateDecode":
+        return zlib.decompress(data)
+    if name == "/ASCIIHexDecode":
+        return binascii.unhexlify(re.sub(rb"\s", b"", data).rstrip(b">"))
+    if name == "/ASCII85Decode":
+        d = re.sub(rb"\s", b"", data)
+        d = d[2:] if d.startswith(b"<~") else d
+        return base64.a85decode(d[:-2] if d.endswith(b"~>") else d)
+    return None
+
+
+def scrub_layered_jpegs(path, td):
+    """Ảnh JPEG bọc thêm lớp nén (vd. [/FlateDecode /DCTDecode], thường gặp khi chèn một PDF
+    khác bằng \\includegraphics): qpdf không bóc được ở mức 'generalized'. Bóc bằng Python,
+    xóa metadata, ghi lại dạng /DCTDecode thuần qua qpdf --update-from-json.
+    Trả về (đường_dẫn_file_mới, số_phân_đoạn_đã_xóa)."""
+    js = json.loads(run(["qpdf", "--json=2", "--json-key=qpdf", "--json-stream-data=none", path],
+                        ok_codes=(0, 3)).stdout)
+    upd, count = {}, 0
+    for key, obj in js["qpdf"][1].items():
+        st = obj.get("stream") if isinstance(obj, dict) else None
+        if not st or st["dict"].get("/Subtype") != "/Image":
+            continue
+        filters = st["dict"].get("/Filter")
+        if not (isinstance(filters, list) and len(filters) > 1 and filters[-1] == "/DCTDecode"):
+            continue
+        parms = st["dict"].get("/DecodeParms")
+        if parms and any(x not in (None, "null") for x in (parms if isinstance(parms, list) else [parms])[:-1]):
+            continue  # có tham số giải nén (predictor...) ở lớp ngoài: hiếm, bỏ qua
+        m = re.match(r"^obj:(\d+) (\d+) R$", key)
+        if not m:
+            continue
+        data = run(["qpdf", f"--show-object={m.group(1)},{m.group(2)}", "--raw-stream-data", path]).stdout
+        try:
+            for f in filters[:-1]:
+                data = _undo_filter(f, data)
+                if data is None:
+                    break
+        except (zlib.error, binascii.Error, ValueError):
+            data = None
+        if data is None:
+            log.warning("bỏ qua ảnh %s: không bóc được lớp nén %s", key, filters)
+            continue
+        buf = bytearray(data)
+        n = scrub_jpeg_metadata(buf)
+        if not n:
+            continue
+        d = {k: v for k, v in st["dict"].items() if k not in ("/Length", "/DecodeParms")}
+        d["/Filter"] = "/DCTDecode"
+        upd[key] = {"stream": {"dict": d, "data": base64.b64encode(bytes(buf)).decode()}}
+        count += n
+    if not upd:
+        return path, 0
+    uj, out = os.path.join(td, "upd.json"), os.path.join(td, "layered.pdf")
+    with open(uj, "w") as f:
+        json.dump({"qpdf": [{"jsonversion": 2}, upd]}, f)
+    run(["qpdf", path, f"--update-from-json={uj}", out], ok_codes=(0, 3))
+    return out, count
+
+
 def sanitize_pdf(raw: bytes):
-    """Trả về (pdf_sạch, title, text). Ném RejectPDF nếu file không chấp nhận được."""
+    """Trả về (pdf_sạch, title, text, số_phân_đoạn_metadata_ảnh_đã_xóa)."""
     if not raw.startswith(b"%PDF-"):
         raise RejectPDF("không phải PDF (thiếu chữ ký %PDF-)")
     if len(raw) > MAX_PDF_BYTES:
@@ -226,31 +338,41 @@ def sanitize_pdf(raw: bytes):
         if run(["qpdf", "--is-encrypted", src], ok_codes=(0, 2)).returncode == 0:
             raise RejectPDF("PDF bị mã hóa")
         # Cấu trúc object dạng JSON (không kèm dữ liệu stream) để tìm tên nguy hiểm
-        js = run(["qpdf", "--json=2", "--json-key=qpdf", "--json-stream-data=none", src],
-                 ok_codes=(0, 3))  # 3 = có cảnh báo nhưng đọc được
+        js = run(["qpdf", "--json=2", "--json-key=qpdf", "--json-stream-data=none", src], ok_codes=(0, 3))
         found = set()
         _walk_names(json.loads(js.stdout), found)
         if found:
             raise RejectPDF("PDF chứa thành phần bị chặn: " + ", ".join(sorted(found)))
+        # Giải nén các lớp nén chung (Flate, ASCII85...) để lộ dữ liệu JPEG gốc, rồi xóa EXIF/XMP/IPTC
+        # trong ảnh. pdfTeX chép nguyên file JPEG vào PDF, kể cả GPS của ảnh chụp bằng điện thoại.
+        qdf = os.path.join(td, "qdf.pdf")
+        run(["qpdf", "--qdf", "--object-streams=disable", "--decode-level=generalized",
+             "--compress-streams=n", src, qdf], ok_codes=(0, 3))
+        buf = bytearray(read_bytes(qdf))
+        scrubbed = scrub_jpeg_metadata(buf)
+        if scrubbed:
+            with open(qdf, "wb") as f:
+                f.write(buf)
+        del buf
+        qdf, n2 = scrub_layered_jpegs(qdf, td)
+        scrubbed += n2
         # Lấy title trước khi xóa metadata
-        info = run(["pdfinfo", src], ok_codes=(0,)).stdout.decode(errors="replace")
+        info = run(["pdfinfo", qdf]).stdout.decode(errors="replace")
         m = re.search(r"^Title:\s*(.+)$", info, re.M)
         title = m.group(1).strip()[:200] if m else ""
-        # Xóa toàn bộ metadata (Info + XMP), chỉ đặt lại Title.
+        # Xóa metadata của PDF (Info + XMP), chỉ đặt lại Title.
         # exiftool sửa PDF theo kiểu incremental update (bản cũ vẫn khôi phục được),
         # nên BẮT BUỘC qpdf ghi lại file ngay sau đó để loại phần cũ.
         stripped = os.path.join(td, "stripped.pdf")
-        cmd = ["exiftool", "-q", "-q", "-all=", "-o", stripped]
-        if title:
-            cmd.insert(-2, f"-Title={title}")
-        run(cmd + [src])
+        cmd = ["exiftool", "-q", "-q", "-all="] + ([f"-Title={title}"] if title else []) + ["-o", stripped, qdf]
+        run(cmd)
         out = os.path.join(td, "out.pdf")
-        run(["qpdf", "--linearize", "--object-streams=generate", stripped, out], ok_codes=(0, 3))
+        run(["qpdf", "--linearize", "--object-streams=generate", "--compress-streams=y", stripped, out],
+            ok_codes=(0, 3))
         run(["qpdf", "--check", out], ok_codes=(0, 3))
-        # Văn bản thuần cho AI/đọc nhanh: thứ tự đọc mặc định (tốt cho bài 2 cột), đánh dấu trang
-        run(["pdftotext", "-enc", "UTF-8", out, os.path.join(td, "out.txt")], ok_codes=(0,))
-        with open(os.path.join(td, "out.txt"), "rb") as f:
-            text = f.read().decode("utf-8", errors="replace")
+        # Văn bản thuần: thứ tự đọc mặc định (tốt cho bài 2 cột), đánh dấu trang
+        run(["pdftotext", "-enc", "UTF-8", out, os.path.join(td, "out.txt")])
+        text = read_bytes(os.path.join(td, "out.txt")).decode("utf-8", errors="replace")
         pages = text.split("\f")
         if pages and not pages[-1].strip():
             pages = pages[:-1]
@@ -259,49 +381,128 @@ def sanitize_pdf(raw: bytes):
             first = next((ln.strip() for ln in text.splitlines()
                           if ln.strip() and not ln.startswith("=====")), "")
             title = first[:120]
-        with open(out, "rb") as f:
-            return f.read(), title, text
+        return read_bytes(out), title, text, scrubbed
 
 
-# ---------------------------------------------------------------- HTTP chung
+# ---------------------------------------------------------------- sinh trang tĩnh
 
 ROBOTS_TRAINING = ["GPTBot", "ClaudeBot", "anthropic-ai", "CCBot", "Google-Extended",
                    "Applebot-Extended", "meta-externalagent", "Bytespider", "cohere-training-data-crawler"]
 
-PUBLIC_HTML_CSP = ("default-src 'none'; style-src 'self'; img-src 'self'; frame-src 'self'; "
-                   "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-PDFJS_CSP = ("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; "
-             "img-src 'self' data: blob:; font-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
-             "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'")
-ADMIN_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
-             "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-
-CTYPES = {
-    ".html": "text/html; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
-    ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
-    ".svg": "image/svg+xml", ".png": "image/png", ".gif": "image/gif", ".ftl": "text/plain; charset=utf-8",
-    ".json": "application/json", ".wasm": "application/wasm", ".bcmap": "application/octet-stream",
-    ".pfb": "application/octet-stream", ".ttf": "font/ttf", ".icc": "application/octet-stream",
-    ".map": "application/json",
-}
-
-
-def safe_join(root, rel):
-    root = os.path.realpath(root)
-    p = os.path.realpath(os.path.join(root, rel.lstrip("/")))
-    if p != root and not p.startswith(root + os.sep):
-        return None
-    return p
+# Trang xem: không có JavaScript. CSP do Nginx VM 1007 gắn (default-src 'none', không script-src).
+VIEW_TMPL = """<!doctype html>
+<html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="{robots}">
+<title>{title}</title>
+<link rel="stylesheet" href="/read.css">
+<link rel="alternate" type="application/pdf" href="/{slug}.pdf" title="PDF">
+<link rel="alternate" type="text/plain" href="/{slug}.txt" title="Văn bản thuần">{tex_link}
+</head><body>
+<header><div class="t"><h1>{title}</h1><span class="u">Cập nhật {updated}</span></div>
+<nav><a href="/{slug}.pdf" download="{slug}.pdf">Tải PDF</a><a href="/{slug}.txt">Văn bản (.txt)</a>{tex_nav}</nav></header>
+<p class="m">Điện thoại không hiện PDF? Bấm <a href="/{slug}.pdf">mở PDF</a> hoặc Tải PDF.</p>
+<main><iframe src="/{slug}.pdf?v={v}" title="{title}"></iframe></main>
+<details><summary>Nội dung dạng văn bản</summary><pre>{text}</pre></details>
+</body></html>
+"""
 
 
 def fmt_time(ts):
     return datetime.fromtimestamp(ts, TZ).strftime("%H:%M %d/%m/%Y") if ts else "—"
 
 
+def www_path(name):
+    return os.path.join(WWW_DIR, name)
+
+
+def unrender(slug):
+    with _render_lock:
+        for ext in ("html", "pdf", "txt", "tex"):
+            try:
+                os.unlink(www_path(f"{slug}.{ext}"))
+            except FileNotFoundError:
+                pass
+
+
+def render(pid):
+    """Ghi bộ file tĩnh của một tài liệu vào WWW_DIR. PDF/TXT/TEX ghi trước, HTML ghi sau cùng
+    để trang không bao giờ trỏ tới file chưa có."""
+    with _render_lock:
+        p = get_pub(pid=pid)
+        if not p or not p["published"] or not p["pdf_sha"]:
+            return
+        slug, d = p["slug"], files_dir(pid)
+        try:
+            pdf = read_bytes(os.path.join(d, "doc.pdf"))
+            txt = read_bytes(os.path.join(d, "doc.txt"))
+        except FileNotFoundError:
+            log.warning("render %s: thiếu file gốc, bỏ qua", pid)
+            return
+        atomic_write(www_path(f"{slug}.pdf"), pdf)
+        atomic_write(www_path(f"{slug}.txt"), txt)
+        tex = bool(p["include_source"] and p["has_tex"] and os.path.exists(os.path.join(d, "doc.tex")))
+        if tex:
+            atomic_write(www_path(f"{slug}.tex"), read_bytes(os.path.join(d, "doc.tex")))
+        else:
+            try:
+                os.unlink(www_path(f"{slug}.tex"))
+            except FileNotFoundError:
+                pass
+        title = html.escape(p["title"] or slug)
+        page = VIEW_TMPL.format(
+            robots="all" if p["indexable"] else "noindex",
+            title=title, slug=slug, v=p["pdf_sha"][:12],
+            updated=fmt_time(p["updated_at"]),
+            tex_link=f'\n<link rel="alternate" type="text/x-tex" href="/{slug}.tex" title="LaTeX">' if tex else "",
+            tex_nav=f'<a href="/{slug}.tex">LaTeX (.tex)</a>' if tex else "",
+            text=html.escape(txt[:MAX_TXT_IN_HTML].decode("utf-8", errors="replace")),
+        )
+        atomic_write(www_path(f"{slug}.html"), page.encode("utf-8"))
+
+
+def reconcile():
+    """Đồng bộ WWW_DIR với CSDL khi khởi động: sinh lại tài liệu đang publish, xóa file thừa."""
+    with _render_lock:
+        os.makedirs(WWW_DIR, exist_ok=True)
+        lines = []
+        if BLOCK_TRAINING_CRAWLERS:
+            lines.append("# Không dùng nội dung để huấn luyện mô hình")
+            for ua in ROBOTS_TRAINING:
+                lines += [f"User-agent: {ua}", "Disallow: /", ""]
+        lines += ["# Trình duyệt và công cụ AI tải link theo yêu cầu người dùng: cho phép",
+                  "User-agent: *", "Allow: /", ""]
+        atomic_write(www_path("robots.txt"), "\n".join(lines).encode())
+        atomic_write(www_path("read.css"), read_bytes(os.path.join(STATIC_DIR, "read.css")))
+        with db() as c:
+            live = {r[0]: r[1] for r in c.execute(
+                "SELECT slug, project_id FROM publications WHERE published=1 AND pdf_sha IS NOT NULL")}
+        for name in os.listdir(WWW_DIR):
+            path = www_path(name)
+            if name in ("robots.txt", "read.css"):
+                continue
+            m = WWW_FILE_RE.match(name)
+            if name.startswith(".tmp-") or not m or m.group(1) not in live:
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.unlink(path)
+                    log.info("reconcile: xóa file thừa %s", name)
+        for slug, pid in live.items():
+            render(pid)
+        log.info("reconcile: %d tài liệu đang publish", len(live))
+
+
+# ---------------------------------------------------------------- HTTP chung
+
+ADMIN_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+             "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+CTYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+
+
 class Base(BaseHTTPRequestHandler):
     server_version = "olpub"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    timeout = 60  # giây chờ tối đa cho mỗi thao tác đọc/ghi socket
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)
@@ -319,10 +520,9 @@ class Base(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def send_json(self, code, obj, headers=None):
-        h = {"Cache-Control": "no-store"}
-        h.update(headers or {})
-        self.send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8", h)
+    def send_json(self, code, obj):
+        self.send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8",
+                  {"Cache-Control": "no-store"})
 
     def read_body(self, limit):
         n = self.headers.get("Content-Length")
@@ -335,123 +535,6 @@ class Base(BaseHTTPRequestHandler):
 
     def path_only(self):
         return urlsplit(self.path).path
-
-    def serve_file(self, path, headers, etag=None, mtime=None):
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except (FileNotFoundError, IsADirectoryError):
-            return self.send(404, "Không tìm thấy\n")
-        ext = os.path.splitext(path)[1].lower()
-        h = dict(headers)
-        if etag:
-            h["ETag"] = f'"{etag}"'
-            if self.headers.get("If-None-Match") == f'"{etag}"':
-                self.send_response(304)
-                for k, v in h.items():
-                    self.send_header(k, v)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-        if mtime:
-            h["Last-Modified"] = formatdate(mtime, usegmt=True)
-        self.send(200, data, h.pop("Content-Type", CTYPES.get(ext, "application/octet-stream")), h)
-
-
-# ---------------------------------------------------------------- PUBLIC :8080
-
-VIEW_TMPL = """<!doctype html>
-<html lang="vi"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<link rel="stylesheet" href="/static/read.css">
-<link rel="alternate" type="application/pdf" href="{pdf}" title="PDF">
-<link rel="alternate" type="text/plain" href="{txt}" title="Văn bản thuần">{tex_link}
-</head><body>
-<header><div class="t"><h1>{title}</h1><span class="u">Cập nhật {updated}</span></div>
-<nav><a href="{pdf}" download>Tải PDF</a><a href="{txt}">Văn bản (.txt)</a>{tex_nav}</nav></header>
-<main><iframe src="{viewer}" title="{title}"></iframe>
-<noscript><p>Trình xem cần JavaScript. <a href="{pdf}">Mở file PDF trực tiếp</a>.</p></noscript></main>
-<details><summary>Nội dung dạng văn bản</summary><pre>{text}</pre></details>
-</body></html>
-"""
-
-
-class PublicHandler(Base):
-    def do_POST(self):
-        self.send(405, "Chỉ hỗ trợ GET\n", headers={"Allow": "GET, HEAD"})
-
-    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_POST
-
-    def do_HEAD(self):
-        self.do_GET()
-
-    def do_GET(self):
-        path = self.path_only()
-        if path == "/robots.txt":
-            lines = []
-            if BLOCK_TRAINING_CRAWLERS:
-                lines.append("# Không dùng nội dung để huấn luyện mô hình")
-                for ua in ROBOTS_TRAINING:
-                    lines += [f"User-agent: {ua}", "Disallow: /", ""]
-            lines += ["# Trình duyệt và công cụ AI tải link theo yêu cầu người dùng: cho phép",
-                      "User-agent: *", "Allow: /", ""]
-            return self.send(200, "\n".join(lines), headers={"Cache-Control": "public, max-age=3600"})
-        if path.startswith("/static/"):
-            p = safe_join(STATIC_DIR, path[len("/static/"):])
-            if not p or not os.path.basename(p).startswith("read"):
-                return self.send(404, "Không tìm thấy\n")
-            return self.serve_file(p, {"Cache-Control": "public, max-age=3600"})
-        if path.startswith("/pdfjs/"):
-            p = safe_join(PDFJS_DIR, path[len("/pdfjs/"):])
-            if not p:
-                return self.send(404, "Không tìm thấy\n")
-            return self.serve_file(p, {"Cache-Control": "public, max-age=86400",
-                                       "Content-Security-Policy": PDFJS_CSP})
-        m = re.match(r"^/([a-z0-9-]{4,64})(\.pdf|\.txt|\.tex)?$", path)
-        if not m:
-            return self.send(404, "Không tìm thấy\n")
-        slug, ext = m.group(1), m.group(2) or ""
-        pub = get_pub(slug=slug)
-        if not pub or not pub["published"] or not pub["pdf_sha"]:
-            return self.send(404, "Không tìm thấy hoặc chưa có bản publish\n")
-        d = files_dir(pub["project_id"])
-        common = {"Cache-Control": "no-cache",
-                  "X-Robots-Tag": "all" if pub["indexable"] else "noindex"}
-        if ext == ".pdf":
-            h = dict(common, **{"Content-Type": "application/pdf",
-                                "Content-Disposition": f'inline; filename="{slug}.pdf"',
-                                "Content-Security-Policy": "default-src 'none'; frame-ancestors 'self'"})
-            return self.serve_file(os.path.join(d, "doc.pdf"), h, pub["pdf_sha"], pub["updated_at"])
-        if ext == ".txt":
-            return self.serve_file(os.path.join(d, "doc.txt"), dict(common, **{
-                "Content-Type": "text/plain; charset=utf-8"}), pub["pdf_sha"] + "-t", pub["updated_at"])
-        if ext == ".tex":
-            if not (pub["include_source"] and pub["has_tex"]):
-                return self.send(404, "Project này không publish mã nguồn\n")
-            return self.serve_file(os.path.join(d, "doc.tex"), dict(common, **{
-                "Content-Type": "text/plain; charset=utf-8"}), pub["pdf_sha"] + "-x", pub["updated_at"])
-        # Trang xem
-        try:
-            with open(os.path.join(d, "doc.txt"), "rb") as f:
-                text = f.read(MAX_TXT_IN_HTML).decode("utf-8", errors="replace")
-        except FileNotFoundError:
-            text = ""
-        v = pub["pdf_sha"][:12]
-        pdf_url = f"/{slug}.pdf"
-        tex = pub["include_source"] and pub["has_tex"]
-        title = html.escape(pub["title"] or slug)
-        page = VIEW_TMPL.format(
-            title=title,
-            updated=fmt_time(pub["updated_at"]),
-            pdf=pdf_url, txt=f"/{slug}.txt",
-            tex_link=f'\n<link rel="alternate" type="text/x-tex" href="/{slug}.tex" title="LaTeX">' if tex else "",
-            tex_nav=f'<a href="/{slug}.tex">LaTeX (.tex)</a>' if tex else "",
-            viewer="/pdfjs/web/viewer.html?file=" + quote(f"{pdf_url}?v={v}", safe=""),
-            text=html.escape(text),
-        )
-        h = dict(common, **{"Content-Security-Policy": PUBLIC_HTML_CSP})
-        self.send(200, page, "text/html; charset=utf-8", h)
 
 
 # ---------------------------------------------------------------- ADMIN :8082
@@ -487,18 +570,15 @@ class AdminHandler(Base):
         if not ident:
             return self.send(401, "Thiếu danh tính (Authelia/mTLS)\n")
         path = self.path_only()
-        if path in ("/_pub/button.js", "/_pub/admin.js"):
-            return self.serve_file(os.path.join(STATIC_DIR, path[len("/_pub/"):]),
-                                   {"Cache-Control": "no-cache"}, etag=str(int(os.path.getmtime(
-                                       os.path.join(STATIC_DIR, path[len("/_pub/"):])))))
-        if path == "/_pub/admin.css":
-            return self.serve_file(os.path.join(STATIC_DIR, "admin.css"), {"Cache-Control": "no-cache"})
+        if path in ("/_pub/button.js", "/_pub/admin.js", "/_pub/admin.css"):
+            name = path[len("/_pub/"):]
+            data = read_bytes(os.path.join(STATIC_DIR, name))
+            return self.send(200, data, CTYPES[os.path.splitext(name)[1]], {"Cache-Control": "no-cache"})
         if path in ("/_pub", "/_pub/"):
             page = ("<!doctype html><html lang='vi'><head><meta charset='utf-8'>"
                     "<meta name='viewport' content='width=device-width, initial-scale=1'>"
                     "<title>Publish — quản lý</title><link rel='stylesheet' href='/_pub/admin.css'></head>"
-                    f"<body data-user='{html.escape(ident[0], quote=True)}'><div id='app'></div>"
-                    "<script src='/_pub/admin.js'></script></body></html>")
+                    "<body><div id='app'></div><script src='/_pub/admin.js'></script></body></html>")
             return self.send(200, page, "text/html; charset=utf-8",
                              {"Content-Security-Policy": ADMIN_CSP, "Cache-Control": "no-store"})
         if path == "/_pub/api/list":
@@ -542,45 +622,55 @@ class AdminHandler(Base):
         action = req.get("action")
         p = get_pub(pid=pid)
         try:
-            if action == "publish":
-                slug = (req.get("slug") or "").strip().lower()
-                if slug:
+            with _render_lock:
+                if action == "publish":
+                    slug = (req.get("slug") or "").strip().lower()
+                    if slug:
+                        self.check_slug(slug, pid)
+                    mode = req.get("mode") if req.get("mode") in ("live", "pinned") else "live"
+                    if not p:
+                        with _db_lock, db() as c:
+                            c.execute("INSERT INTO publications(project_id, slug, published, mode, refresh_requested,"
+                                      " created_by, created_at) VALUES (?,?,1,?,1,?,?)",
+                                      (pid, slug or new_slug(), mode, user, time.time()))
+                    else:
+                        if slug and slug != p["slug"]:
+                            unrender(p["slug"])
+                        update_pub(pid, published=1, mode=mode, refresh_requested=1, last_error=None,
+                                   **({"slug": slug} if slug else {}))
+                        render(pid)
+                elif not p:
+                    return self.send_json(404, {"error": "Project chưa từng publish"})
+                elif action == "unpublish":
+                    unrender(p["slug"])
+                    update_pub(pid, published=0, refresh_requested=0, pdf_sha=None, pdf_size=None,
+                               has_tex=0, build_mtime=0, updated_at=None, last_error=None)
+                    remove_files(pid)
+                elif action == "set_mode":
+                    mode = req.get("mode")
+                    if mode not in ("live", "pinned"):
+                        raise ValueError("mode phải là live hoặc pinned")
+                    update_pub(pid, mode=mode, **({"refresh_requested": 1} if mode == "live" else {}))
+                elif action == "refresh":
+                    update_pub(pid, refresh_requested=1, last_error=None)
+                elif action == "set_source":
+                    on = bool(req.get("enabled"))
+                    update_pub(pid, include_source=int(on), **({"refresh_requested": 1} if on else {"has_tex": 0}))
+                    if not on:
+                        remove_files(pid, ("doc.tex",))
+                    render(pid)
+                elif action == "set_indexable":
+                    update_pub(pid, indexable=int(bool(req.get("enabled"))))
+                    render(pid)
+                elif action == "set_slug":
+                    slug = (req.get("slug") or "").strip().lower()
                     self.check_slug(slug, pid)
-                mode = req.get("mode") if req.get("mode") in ("live", "pinned") else "live"
-                if not p:
-                    with _db_lock, db() as c:
-                        c.execute("INSERT INTO publications(project_id, slug, published, mode, refresh_requested,"
-                                  " created_by, created_at) VALUES (?,?,1,?,1,?,?)",
-                                  (pid, slug or new_slug(), mode, user, time.time()))
+                    if slug != p["slug"]:
+                        unrender(p["slug"])
+                        update_pub(pid, slug=slug)
+                        render(pid)
                 else:
-                    update_pub(pid, published=1, mode=mode, refresh_requested=1, last_error=None,
-                               **({"slug": slug} if slug else {}))
-            elif not p:
-                return self.send_json(404, {"error": "Project chưa từng publish"})
-            elif action == "unpublish":
-                update_pub(pid, published=0, refresh_requested=0, pdf_sha=None, pdf_size=None,
-                           has_tex=0, build_mtime=0, updated_at=None, last_error=None)
-                remove_files(pid)
-            elif action == "set_mode":
-                mode = req.get("mode")
-                if mode not in ("live", "pinned"):
-                    raise ValueError("mode phải là live hoặc pinned")
-                update_pub(pid, mode=mode, **({"refresh_requested": 1} if mode == "live" else {}))
-            elif action == "refresh":
-                update_pub(pid, refresh_requested=1, last_error=None)
-            elif action == "set_source":
-                on = bool(req.get("enabled"))
-                update_pub(pid, include_source=int(on), **({"refresh_requested": 1} if on else {"has_tex": 0}))
-                if not on:
-                    remove_files(pid, ("doc.tex",))
-            elif action == "set_indexable":
-                update_pub(pid, indexable=int(bool(req.get("enabled"))))
-            elif action == "set_slug":
-                slug = (req.get("slug") or "").strip().lower()
-                self.check_slug(slug, pid)
-                update_pub(pid, slug=slug)
-            else:
-                return self.send_json(400, {"error": "action không hợp lệ"})
+                    return self.send_json(400, {"error": "action không hợp lệ"})
         except ValueError as e:
             return self.send_json(400, {"error": str(e)})
         audit(user, device, pid, action, json.dumps({k: v for k, v in req.items() if k != "action"},
@@ -659,7 +749,7 @@ class InternalHandler(Base):
         except ValueError:
             build_mtime = 0.0
         try:
-            pdf, title, text = sanitize_pdf(body)
+            pdf, title, text, scrubbed = sanitize_pdf(body)
         except (RejectPDF, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
             msg = str(e) if isinstance(e, RejectPDF) else f"xử lý PDF thất bại: {e.__class__.__name__}"
             # không publish bản lỗi; bản cũ (nếu có) vẫn giữ nguyên
@@ -669,19 +759,22 @@ class InternalHandler(Base):
             return self.send_json(422, {"error": msg})
         sha = hashlib.sha256(pdf).hexdigest()
         d = files_dir(pid)
-        atomic_write(os.path.join(d, "doc.txt"), text.encode("utf-8"))
-        atomic_write(os.path.join(d, "doc.pdf"), pdf)
-        pending = os.path.join(d, "doc.tex.pending")
-        has_tex = 0
-        if p["include_source"] and os.path.exists(pending):
-            os.replace(pending, os.path.join(d, "doc.tex"))
-            has_tex = 1
-        elif p["include_source"] and os.path.exists(os.path.join(d, "doc.tex")):
-            has_tex = 1
-        update_pub(pid, pdf_sha=sha, pdf_size=len(pdf), title=title or p["title"], build_mtime=build_mtime,
-                   updated_at=time.time(), refresh_requested=0, last_error=None, has_tex=has_tex)
-        audit("collector", "-", pid, "ingest", f"sha={sha[:12]} size={len(pdf)} tex={has_tex}")
-        self.send_json(200, {"ok": True, "sha": sha})
+        with _render_lock:
+            atomic_write(os.path.join(d, "doc.txt"), text.encode("utf-8"))
+            atomic_write(os.path.join(d, "doc.pdf"), pdf)
+            pending = os.path.join(d, "doc.tex.pending")
+            has_tex = 0
+            if p["include_source"] and os.path.exists(pending):
+                os.replace(pending, os.path.join(d, "doc.tex"))
+                has_tex = 1
+            elif p["include_source"] and os.path.exists(os.path.join(d, "doc.tex")):
+                has_tex = 1
+            update_pub(pid, pdf_sha=sha, pdf_size=len(pdf), title=title or p["title"], build_mtime=build_mtime,
+                       updated_at=time.time(), refresh_requested=0, last_error=None, has_tex=has_tex)
+            render(pid)
+        audit("collector", "-", pid, "ingest",
+              f"sha={sha[:12]} size={len(pdf)} tex={has_tex} img_meta_scrubbed={scrubbed}")
+        self.send_json(200, {"ok": True, "sha": sha, "img_meta_scrubbed": scrubbed})
 
 
 # ---------------------------------------------------------------- main
@@ -703,11 +796,9 @@ def main():
     for tool in ("qpdf", "exiftool", "pdfinfo", "pdftotext"):
         if not shutil.which(tool):
             raise SystemExit(f"Thiếu công cụ: {tool}")
-    if not os.path.exists(os.path.join(PDFJS_DIR, "web", "viewer.html")):
-        log.warning("Chưa có PDF.js tại %s — trang xem sẽ trống, link .pdf/.txt vẫn chạy", PDFJS_DIR)
     InternalHandler.token = load_token()
     init_db()
-    serve(PUBLIC_BIND, PublicHandler)
+    reconcile()
     serve(ADMIN_BIND, AdminHandler)
     serve(INTERNAL_BIND, InternalHandler)
     threading.Event().wait()

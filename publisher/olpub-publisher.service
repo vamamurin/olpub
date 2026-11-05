@@ -1,5 +1,5 @@
 [Unit]
-Description=olpub publisher (read.tapama.cloud + API publish)
+Description=olpub publisher (API publish + sinh trang tĩnh cho read.tapama.cloud)
 After=network-online.target
 Wants=network-online.target
 
@@ -12,14 +12,14 @@ ExecStart=/usr/bin/python3 /opt/olpub/olpub_publisher.py
 Restart=on-failure
 RestartSec=3
 
-# Chỉ Nginx (VM 100) và collector (VM 1006) được nói chuyện với dịch vụ này;
+# Chỉ Nginx VM 100 (cổng admin) và collector VM 1006 (cổng internal) được kết nối tới;
 # dịch vụ cũng không thể tự mở kết nối ra ngoài (chặn SSRF / exfiltration).
 IPAddressDeny=any
 IPAddressAllow=10.0.10.12 10.0.30.56 127.0.0.1 ::1
 
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/olpub
+ReadWritePaths=/var/lib/olpub /srv/olpub/www
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -37,6 +37,7 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 UMask=0027
+# File trong /srv/olpub/www thuộc group www-data (thư mục setgid) để Nginx đọc được, chmod 640
 MemoryMax=1G
 TasksMax=128
 
