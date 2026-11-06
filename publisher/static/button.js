@@ -29,6 +29,11 @@
                        'width:' + UNIT + 'px;height:' + UNIT + 'px;visibility:hidden'
   var root = host.attachShadow({ mode: 'closed' })
 
+  // Nút nằm cạnh mục Help trong rail. Không cho sự kiện chuột/focus nổi ra ngoài nút,
+  // nếu không tooltip "Help" của Overleaf tưởng chuột đang ở trên Help.
+  ;['mouseover', 'mouseout', 'pointerover', 'pointerout', 'focusin', 'focusout']
+    .forEach(function (t) { host.addEventListener(t, function (e) { e.stopPropagation() }) })
+
   // Font và độ rộng đưa vào qua biến CSS (CSSOM) — không ghép chuỗi vào HTML/CSS,
   // nên giá trị lạ (vd. tên font chứa "</style>") không thể phá ra thành thẻ HTML.
   try { host.style.setProperty('--ol-font', getComputedStyle(document.body).fontFamily || '') } catch (e) {}
@@ -357,7 +362,7 @@ input[type=radio],input[type=checkbox]{accent-color:var(--ol-green);margin:0}
       }))
 
       var links = panel.appendChild(el('div', { className: 'links' }))
-      ;[['Mở trang', s.url], ['.pdf', s.pdf_url], ['.txt', s.txt_url], ['.tex', s.tex_url]]
+      ;[['Mở', s.url]]
         .forEach(function (p) {
           var href = p[1] && safeHref(p[1])
           if (!href) return
@@ -385,16 +390,14 @@ input[type=radio],input[type=checkbox]{accent-color:var(--ol-green);margin:0}
         panel.appendChild(l)
       })
 
-      ;[['include_source', 'set_source', 'Kèm mã LaTeX (.tex, đã xóa comment)'],
-        ['indexable', 'set_indexable', 'Cho phép Google/Bing đưa vào kết quả tìm kiếm']]
-        .forEach(function (o) {
-          var l = el('label')
-          l.appendChild(toggle('checkbox', !!s[o[0]], function (ev) {
-            act({ action: o[1], enabled: ev.target.checked })
-          }))
-          l.appendChild(document.createTextNode(o[2]))
-          panel.appendChild(l)
-        })
+      var lx = el('label', { title: 'Chỉ cho phép, không tự gửi lên Google/Bing. Trang chỉ xuất hiện ' +
+        'trong kết quả tìm kiếm khi link được đăng ở nơi công khai. Tắt lại thì phải chờ vài ngày ' +
+        'tới vài tuần để biến mất khỏi kết quả.' })
+      lx.appendChild(toggle('checkbox', !!s.indexable, function (ev) {
+        act({ action: 'set_indexable', enabled: ev.target.checked })
+      }))
+      lx.appendChild(document.createTextNode('Cho phép Google/Bing đưa vào kết quả tìm kiếm'))
+      panel.appendChild(lx)
 
       sep()
       var slug2 = el('input', { type: 'text', value: s.slug })
@@ -465,6 +468,19 @@ input[type=radio],input[type=checkbox]{accent-color:var(--ol-green);margin:0}
   root.addEventListener('focusout', function () { typing = false })
   root.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && !panel.hidden) closePanel()
+  })
+  // Bấm ra ngoài panel và ngoài nút thì đóng panel
+  document.addEventListener('pointerdown', function (e) {
+    if (panel.hidden) return
+    var path = e.composedPath ? e.composedPath() : []
+    if (path.indexOf(host) < 0) closePanel()
+  }, true)
+  // Bấm vào iframe (vd. khung xem PDF của Overleaf) không báo ra trang → nhận biết qua blur
+  window.addEventListener('blur', function () {
+    setTimeout(function () {
+      var a = document.activeElement
+      if (!panel.hidden && a && a.tagName === 'IFRAME') closePanel()
+    }, 0)
   })
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) stopPoll()
