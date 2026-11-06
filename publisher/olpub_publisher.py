@@ -417,11 +417,20 @@ def www_path(name):
     return os.path.join(WWW_DIR, name)
 
 
+# PDF của tài liệu được phép index nằm trong thư mục con này; Nginx tĩnh tìm ở thư mục
+# thường trước (gắn X-Robots-Tag: noindex), không thấy mới tìm ở đây (không gắn header).
+INDEXED_DIR = os.path.join(WWW_DIR, "indexed")
+
+
+def indexed_path(name):
+    return os.path.join(INDEXED_DIR, name)
+
+
 def unrender(slug):
     with _render_lock:
-        for ext in ("html", "pdf", "txt", "tex"):
+        for path in [www_path(f"{slug}.{e}") for e in ("html", "pdf", "txt", "tex")] + [indexed_path(f"{slug}.pdf")]:
             try:
-                os.unlink(www_path(f"{slug}.{ext}"))
+                os.unlink(path)
             except FileNotFoundError:
                 pass
 
@@ -440,7 +449,14 @@ def render(pid):
         except FileNotFoundError:
             log.warning("render %s: thiếu file gốc, bỏ qua", pid)
             return
-        atomic_write(www_path(f"{slug}.pdf"), pdf)
+        # PDF ghi vào đúng một chỗ theo lựa chọn index, rồi xóa bản ở chỗ còn lại
+        keep, drop = ((indexed_path(f"{slug}.pdf"), www_path(f"{slug}.pdf")) if p["indexable"]
+                      else (www_path(f"{slug}.pdf"), indexed_path(f"{slug}.pdf")))
+        atomic_write(keep, pdf)
+        try:
+            os.unlink(drop)
+        except FileNotFoundError:
+            pass
         atomic_write(www_path(f"{slug}.txt"), txt)
         tex = bool(p["include_source"] and p["has_tex"] and os.path.exists(os.path.join(d, "doc.tex")))
         if tex:
@@ -466,6 +482,7 @@ def reconcile():
     """Đồng bộ WWW_DIR với CSDL khi khởi động: sinh lại tài liệu đang publish, xóa file thừa."""
     with _render_lock:
         os.makedirs(WWW_DIR, exist_ok=True)
+        os.makedirs(INDEXED_DIR, exist_ok=True)   # kế thừa group + setgid của thư mục cha
         lines = []
         if BLOCK_TRAINING_CRAWLERS:
             lines.append("# Không dùng nội dung để huấn luyện mô hình")
@@ -487,8 +504,15 @@ def reconcile():
                 if os.path.isfile(path) or os.path.islink(path):
                     os.unlink(path)
                     log.info("reconcile: xóa file thừa %s", name)
+        for name in os.listdir(INDEXED_DIR):
+            path = indexed_path(name)
+            m = WWW_FILE_RE.match(name)
+            if not (m and m.group(2) == "pdf" and m.group(1) in live):
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.unlink(path)
+                    log.info("reconcile: xóa file thừa indexed/%s", name)
         for slug, pid in live.items():
-            render(pid)
+            render(pid)     # render tự xóa bản PDF ở chỗ không đúng với lựa chọn index
         log.info("reconcile: %d tài liệu đang publish", len(live))
 
 
