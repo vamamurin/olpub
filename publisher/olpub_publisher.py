@@ -5,7 +5,8 @@ Từ bản 1.1, Python KHÔNG còn trả lời người xem. Publisher sinh sẵ
 OLPUB_WWW_DIR; Nginx trên chính VM 1007 phục vụ thư mục đó ở cổng 8080.
 
 Hai listener Python còn lại, đều không mở cho người lạ:
-  ADMIN    :8082  overleaf.tapama.cloud/_pub/  — sau mTLS + Authelia, Nginx gắn X-Pub-User / X-Pub-Device
+  ADMIN    :8082  overleaf.tapama.cloud/_pub/button.js + /_pub/api/ — sau mTLS + Authelia;
+                  Nginx gắn X-Pub-User / X-Pub-Device và ghim mã băm SRI của button.js
   INTERNAL :8081  collector trên VM 1006       — Bearer token, nhận PDF/TeX đã biên dịch
 
 Chỉ dùng thư viện chuẩn Python (>= 3.11) + qpdf, exiftool, poppler-utils.
@@ -493,9 +494,6 @@ def reconcile():
 
 # ---------------------------------------------------------------- HTTP chung
 
-ADMIN_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
-             "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-CTYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
 
 
 class Base(BaseHTTPRequestHandler):
@@ -570,17 +568,10 @@ class AdminHandler(Base):
         if not ident:
             return self.send(401, "Thiếu danh tính (Authelia/mTLS)\n")
         path = self.path_only()
-        if path in ("/_pub/button.js", "/_pub/admin.js", "/_pub/admin.css"):
-            name = path[len("/_pub/"):]
-            data = read_bytes(os.path.join(STATIC_DIR, name))
-            return self.send(200, data, CTYPES[os.path.splitext(name)[1]], {"Cache-Control": "no-cache"})
-        if path in ("/_pub", "/_pub/"):
-            page = ("<!doctype html><html lang='vi'><head><meta charset='utf-8'>"
-                    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-                    "<title>Publish — quản lý</title><link rel='stylesheet' href='/_pub/admin.css'></head>"
-                    "<body><div id='app'></div><script src='/_pub/admin.js'></script></body></html>")
-            return self.send(200, page, "text/html; charset=utf-8",
-                             {"Content-Security-Policy": ADMIN_CSP, "Cache-Control": "no-store"})
+        if path == "/_pub/button.js":
+            # Nginx VM 100 ghim mã băm SRI của file này; trả nguyên byte, không biến đổi
+            return self.send(200, read_bytes(os.path.join(STATIC_DIR, "button.js")),
+                             "text/javascript; charset=utf-8", {"Cache-Control": "no-cache"})
         if path == "/_pub/api/list":
             with db() as c:
                 pids = [r[0] for r in c.execute(

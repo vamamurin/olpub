@@ -1,6 +1,6 @@
 # Runbook sửa đổi — Nâng cấp olpub 1.0 → 1.1 · `read.tapama.cloud`
 
-> **Phiên bản:** 1.1 — 05/11/2026
+> **Phiên bản:** 1.1 — 05/11/2026, sửa 06/11/2026 (bỏ `00-default-ssl.conf` vì `00-default-redirect.conf` đã có server 443 mặc định; thêm kiểm tra `read.conf` và location publish đã bật; thêm 3.2b: ghim mã băm SRI cho `button.js`, bỏ trang quản lý `/_pub/`)
 > **Áp dụng cho:** hệ thống đã dựng theo **Runbook olpub 1.0** (`claude/runbook-olpub-publish.md`). Runbook 1.0 **giữ nguyên** làm tài liệu gốc; tài liệu này chỉ ghi phần thay đổi. Mục nào không nhắc tới ở đây thì vẫn theo bản 1.0.
 > **Thời gian gián đoạn:** trang công khai khoảng 1 phút. Overleaf và collector không bị gián đoạn.
 >
@@ -22,10 +22,10 @@
 | 2 | **Bỏ PDF.js**, dùng trình xem PDF có sẵn của trình duyệt. Trang xem **không còn dòng JavaScript nào**; CSP `default-src 'none'` không có `script-src` | Đóng đường XSS qua PDF.js (kiểu CVE-2024-4367). Trình xem của trình duyệt chạy trong sandbox và tự cập nhật |
 | 3 | **Tự động xóa EXIF/GPS/XMP/IPTC của ảnh JPEG nhúng trong PDF**, kể cả ảnh bọc thêm lớp nén (`[/FlateDecode /DCTDecode]`, gặp khi chèn PDF khác bằng `\includegraphics`) | pdfTeX chép nguyên file JPEG vào PDF, kể cả tọa độ GPS và đời máy của ảnh chụp bằng điện thoại. Bản 1.0 chỉ xóa metadata của PDF, không xóa metadata của ảnh |
 | 4 | **VM 1007 không đi Internet được** (Proxmox FW `policy_out: DROP`), chỉ mở DNS, NTP, Wazuh | Kể cả khi bị chiếm root, máy cũng không gọi về C2 được |
-| 5 | VM 100: `ssl_reject_handshake` cho SNI lạ hoặc IP trần; `limit_conn` + `limit_rate` cho `read` | Không lộ chứng chỉ của site khác; một bot tải liên tục PDF lớn không làm nghẽn đường mạng chung |
+| 5 | VM 100: `limit_conn` + `limit_rate` cho `read`. (`ssl_reject_handshake` cho SNI lạ hoặc IP trần **đã có sẵn** trong `00-default-redirect.conf`, không thêm gì) | Một bot tải liên tục PDF lớn không làm nghẽn đường mạng chung |
 | 6 | Trang gốc `/` trả 404 trống. Tùy chọn "cho phép index" chuyển sang thẻ `<meta name="robots">` của trang xem; `.pdf/.txt/.tex` luôn `noindex` | Cấu hình Nginx tĩnh đơn giản, không cần `if` |
 
-**Các mục của runbook 1.0 bị thay thế bởi tài liệu này:** 1 (bảng thành phần: cổng 8080), 4.2 (Proxmox FW VM 1007, thêm NTP), 5.1 (Nginx tĩnh thay PDF.js), 6.3 (thêm `00-default-ssl.conf`), 7 (thêm kiểm chứng), 8 (vận hành), 10 (giới hạn). Các mục 2, 3, 4.1, 4.3, 5.2, 6.1, 6.2, 9.2, 9.3 **không đổi**.
+**Các mục của runbook 1.0 bị thay thế bởi tài liệu này:** 1 (bảng thành phần: cổng 8080), 4.2 (Proxmox FW VM 1007, thêm NTP), 5.1 (Nginx tĩnh thay PDF.js), 7 (thêm kiểm chứng), 8 (vận hành), 10 (giới hạn). Các mục 2, 3, 4.1, 4.3, 5.2, 6.1, 6.2, 6.3, 9.2, 9.3 **không đổi**.
 
 **Kiến trúc sau nâng cấp:**
 
@@ -51,7 +51,8 @@ VM 1006 collector (token) ──────────────────
 |---|---|---|
 | 2.1 | Snapshot VM 1007 | Trên `pve-control`: `qm snapshot 1007 pre-olpub-1-1` |
 | 2.2 | Sao lưu cấu hình sẽ bị thay | VM 100: `sudo cp /etc/nginx/sites-available/read.conf /root/read.conf.pre-1.1 && sudo cp /etc/nginx/conf.d/olpub.conf /root/olpub.conf.pre-1.1` · `pve-control`: `cp /etc/pve/firewall/1007.fw /root/1007.fw.pre-1.1` |
-| 2.3 | ⚠️ Không có server block 443 nào khác khai `default_server` | VM 100: `grep -Rn "default_server" /etc/nginx/sites-enabled/` — chỉ được thấy `00-default-redirect.conf` (cổng 80) |
+| 2.3 | Xác nhận server 443 mặc định đã từ chối TLS | VM 100: `grep -n "ssl_reject_handshake" /etc/nginx/sites-available/00-default-redirect.conf` phải có kết quả. **Không** thêm server block `default_server` nào khác (sẽ lỗi `duplicate default server`) |
+| 2.3b | ⚠️ `read.conf` và hai location publish của `overleaf.conf` **đang thực sự bật** | `ls -l /etc/nginx/sites-enabled/ \| grep read` phải có symlink; `grep -nE "^\s*#\s*location" /etc/nginx/sites-available/overleaf.conf` không được ra location `/_pub/` hay `/project/` bị comment. Sửa theo mục 3.2 nếu thiếu |
 | 2.4 | ⚠️ pfSense có dịch vụ NTP nghe trên VLAN 30 | Services → NTP → Interfaces: chọn `opt3` nếu chưa có |
 | 2.5 | Nên làm trước: bản 1.0 chạy được trọn vòng (đã có `ingest` trong log publisher) | Nếu collector chưa đẩy được PDF, xem bảng 9.1 ở cuối tài liệu này. Nâng cấp không sửa lỗi đó, nhưng có vòng chạy đúng thì dễ kiểm chứng hơn |
 
@@ -109,18 +110,100 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/robots.txt    # 2
 
 ### 3.2 VM 100
 
+**Làm sau khi xong 3.1.** `read.conf` bản 1.1 bỏ location `/pdfjs/` (có hạn mức riêng). Nếu VM 1007 vẫn là Python 1.0, lần đầu mở trang sẽ tải khoảng 40 file PDF.js và chạm `burst=20`. Kiểm tra trước:
+
 ```bash
-cd <thư mục olpub 1.1>
-sudo install -m 644 nginx/conf.d-olpub.conf /etc/nginx/conf.d/olpub.conf      # thêm limit_conn_zone + map băng thông PDF
-sudo install -m 644 nginx/read.conf /etc/nginx/sites-available/read.conf      # bỏ location /pdfjs/, thêm limit_conn/limit_rate
-sudo install -m 644 nginx/00-default-ssl.conf /etc/nginx/sites-available/00-default-ssl.conf
-sudo ln -sf ../sites-available/00-default-ssl.conf /etc/nginx/sites-enabled/00-default-ssl.conf
-sudo nginx -t && sudo systemctl reload nginx
+curl -sI http://10.0.30.57:8080/robots.txt | grep -i '^server'      # phải ra: Server: nginx
 ```
 
-⚠️ Nếu các site có nghe IPv6 (`listen [::]:443 ssl`), thêm `listen [::]:443 ssl default_server;` vào `00-default-ssl.conf`.
+```bash
+cd <thư mục olpub 1.1>
+sudo cp /etc/nginx/sites-available/overleaf.conf /root/overleaf.conf.pre-1.1
+sudo install -m 644 nginx/conf.d-olpub.conf /etc/nginx/conf.d/olpub.conf      # thêm limit_conn_zone + map băng thông PDF
+sudo install -m 644 nginx/read.conf /etc/nginx/sites-available/read.conf      # bỏ location /pdfjs/, thêm limit_conn/limit_rate
+sudo ls -l /etc/letsencrypt/live/read.tapama.cloud/                           # phải có fullchain.pem, privkey.pem
+sudo ln -sfn ../sites-available/read.conf /etc/nginx/sites-enabled/read.conf # bật (nếu đã bật thì lệnh không đổi gì)
+sudo nginx -t && sudo systemctl reload nginx                                  # reload, KHÔNG restart
+```
 
-`overleaf.conf` **không đổi**.
+Nếu `nginx -t` lỗi: **không reload**; gỡ symlink `read.conf` vừa tạo và xem thông báo lỗi.
+
+**Không** thêm server block 443 `default_server` nào. `00-default-redirect.conf` đã có server 443 `default_server` với `ssl_reject_handshake on` (cả IPv4 và IPv6); thêm một cái nữa sẽ làm `nginx -t` báo `duplicate default server`.
+
+**`overleaf.conf`:** không đổi so với runbook 1.0, nhưng hai location `~ "^/project/[0-9a-f]{24}$"` (chèn nút) và `/_pub/` (API) **phải đang bật** (không bị comment), và nằm **sau** dòng `include snippets/authelia.conf;` ở cấp server. Thiếu chúng thì không có nút Publish và `/_pub/` trả 404 từ Overleaf.
+
+Kiểm tra nhanh sau reload:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://read.tapama.cloud/        # 404 (trang gốc) — không phải lỗi TLS
+curl -s -o /dev/null -w "%{http_code}\n" --cert <thiết bị>.crt --key <thiết bị>.key \
+  https://overleaf.tapama.cloud/_pub/api/list                              # 302 sang auth.tapama.cloud — không phải 404
+```
+
+### 3.2b Ghim mã băm `button.js` (SRI) — sửa 06/11/2026
+
+**Vì sao:** ở bản 1.0, `button.js` do VM 1007 trả về nhưng chạy trong origin `overleaf.tapama.cloud`, kèm nonce CSP hợp lệ. Nếu VM 1007 bị chiếm, kẻ tấn công có thể:
+1. Sửa `button.js`.
+2. Script đó chạy bằng phiên Overleaf của thành viên mở editor, vượt qua cả mTLS lẫn Authelia vì người dùng đã đăng nhập từ trước.
+3. Script thêm `latexmkrc` vào một project rồi bấm biên dịch, và lệnh chạy được trong container Overleaf trên VM 1006.
+
+Trang quản lý `/_pub/` cũng cho phép điều tương tự, và VM 1007 còn có thể dùng `Set-Cookie` để ghi đè cookie phiên Overleaf.
+
+**Cách sửa, giữ đúng vai trò "Nginx chỉ áp chính sách, không chứa code ứng dụng":**
+
+| Thành phần | Nằm ở | Nginx VM 100 làm gì |
+|---|---|---|
+| `button.js` | VM 1007 `/opt/olpub/static/` (như cũ) | Gắn `integrity="sha384-…"` vào thẻ script mà nó vốn đã chèn. File bị sửa → mã băm không khớp → **trình duyệt không chạy**, nút biến mất. Phản hồi bị ép CSP `sandbox` (phòng trường hợp mở thẳng URL) và bị xóa `Set-Cookie` |
+| `/_pub/api/` | VM 1007 | Chuyển tiếp; ép CSP `sandbox`, xóa `Set-Cookie` |
+| Trang quản lý `/_pub/` | **Bỏ** | Trang HTML chạy trong origin Overleaf thì không ghim được. Mọi chức năng đã có trong nút |
+| Mọi đường dẫn khác dưới `/_pub/` | — | `404` |
+
+Mã băm nằm trong `/etc/nginx/conf.d/olpub.conf`, ở dòng có đánh dấu `# olpub-button-sri`. Đó là một **quy tắc chính sách**, không phải code.
+
+**Đã thử bằng trình duyệt thật:**
+- VM 1007 sửa `button.js` (thêm `alert`): nút biến mất, không có code nào chạy, console báo lỗi integrity.
+- Mở thẳng `/_pub/button.js` khi VM 1007 trả về HTML độc: script bị chặn do sandbox.
+- Sửa hợp lệ, rồi `olpub-sri set`: nút chạy lại.
+- Truyền mã băm rác cho `olpub-sri set`: bị từ chối.
+
+**VM 1007**: dọn hai file của trang quản lý cũ.
+
+```bash
+sudo rm -f /opt/olpub/static/admin.js /opt/olpub/static/admin.css
+ls /opt/olpub/static/                        # còn: button.js, read.css
+```
+
+**VM 100**
+
+```bash
+cd <thư mục olpub 1.1>
+sudo install -m 644 nginx/conf.d-olpub.conf /etc/nginx/conf.d/olpub.conf     # đã có map $olpub_button_sri
+sudo install -m 755 tools/olpub-sri /usr/local/sbin/olpub-sri
+```
+
+Trong `overleaf.conf`, sửa hai chỗ theo file mẫu `nginx/overleaf.conf`:
+1. **Location editor:** dòng `sub_filter` thêm `integrity="$olpub_button_sri"`, thành:
+   `sub_filter '</body>' '<script nonce="$olpub_nonce" src="/_pub/button.js" integrity="$olpub_button_sri" defer></script></body>';`
+2. **Thay** location `/_pub/` cũ bằng **ba** location trong đoạn `# --- Publish ---`: `= /_pub/button.js`, `/_pub/api/` và `/_pub/` (trả 404).
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+sudo olpub-sri check                          # phải ra: KHỚP — nút hoạt động
+```
+
+**Khi sửa `button.js` sau này:**
+
+```bash
+# 1. Trên máy có bản bạn vừa sửa (bản bạn TIN), tính mã băm:
+olpub-sri hash button.js            # hoặc: printf 'sha384-%s\n' "$(openssl dgst -sha384 -binary button.js | openssl base64 -A)"
+# 2. Chép file sang VM 1007:
+sudo install -m 644 button.js /opt/olpub/static/button.js
+# 3. Trên VM 100, ghim mã băm mới (tự chạy nginx -t, reload; lỗi thì tự hoàn tác):
+sudo olpub-sri set sha384-…
+sudo olpub-sri check
+```
+
+> **Đừng** tính mã băm từ file tải về từ VM 1007 rồi ghim. Nếu VM 1007 đã bị chiếm, làm vậy là ghim chính bản độc. `olpub-sri check` chỉ dùng để **so sánh**. Nếu nó báo KHÔNG KHỚP mà không ai vừa sửa nút, nghĩa là file trên VM 1007 đã bị thay đổi.
 
 ### 3.3 Tường lửa và NTP
 
@@ -170,6 +253,9 @@ Các bước 1–6 và 10–13 ở mục 7 của runbook 1.0 vẫn áp dụng. T
 | U12 | Publish tài liệu có ảnh chụp điện thoại, tải `.pdf`, `pdfimages -j <file>.pdf img && exiftool img-*.jpg \| grep -iE "gps\|make\|model"` | Không có dòng nào |
 | U13 | Từ VM 1006: `nc -zv -w 3 10.0.30.57 8081` | Thành công (collector vẫn đẩy được) |
 | U14 | Wazuh dashboard: agent VM 1007 | Vẫn `Active` sau khi chặn đường ra |
+| U15 | Mở một project | Nút 🌐 hiện trong rail trái, ngay trên dấu `?`; panel mở được; console không có lỗi CSP hay `integrity` |
+| U16 | VM 100: `sudo olpub-sri check` | `KHỚP — nút hoạt động` |
+| U17 | `curl … https://overleaf.tapama.cloud/_pub/` (có chứng chỉ + phiên Authelia) | `404` (trang quản lý đã bỏ) |
 
 ---
 
@@ -177,8 +263,10 @@ Các bước 1–6 và 10–13 ở mục 7 của runbook 1.0 vẫn áp dụng. T
 
 | Việc | Cách làm |
 |---|---|
-| Gỡ một tài liệu | Như cũ: nút trong editor, hoặc `https://overleaf.tapama.cloud/_pub/` |
-| **Tắt khẩn cấp trang công khai** | VM 1007: `sudo systemctl stop nginx` (người xem nhận 502). Không gỡ symlink `read.conf` ở VM 100: request `read` khi đó rơi vào `00-default-ssl` và bị từ chối TLS, khó chẩn đoán |
+| Gỡ một tài liệu | Nút trong editor (trang `/_pub/` đã bỏ) |
+| Sửa giao diện nút | Theo cuối mục 3.2b: sửa → `olpub-sri hash` → chép sang VM 1007 → `olpub-sri set` |
+| Nút đột nhiên biến mất | `sudo olpub-sri check` trên VM 100. KHÔNG KHỚP mà không ai sửa nút → **coi như VM 1007 có dấu hiệu bị xâm nhập** |
+| **Tắt khẩn cấp trang công khai** | VM 1007: `sudo systemctl stop nginx` (người xem nhận 502). Không gỡ symlink `read.conf` ở VM 100: request `read` khi đó rơi vào server 443 mặc định của `00-default-redirect.conf` và bị từ chối TLS, khó chẩn đoán |
 | **Cập nhật gói VM 1007** | Proxmox GUI → VM 1007 → Firewall → bật rule `apt update - CHI BAT TAM` → `sudo apt update && sudo apt upgrade` → **tắt rule lại**. `unattended-upgrades` không chạy được vì không có Internet, nên hãy cập nhật thủ công theo cảnh báo lỗ hổng của Wazuh |
 | Cập nhật PDF.js | **Không còn cần** |
 | Đổi token ingest | Như cũ |
@@ -211,7 +299,6 @@ qm rollback 1007 pre-olpub-1-1 && qm start 1007
 cp /root/1007.fw.pre-1.1 /etc/pve/firewall/1007.fw
 
 # VM 100
-sudo rm -f /etc/nginx/sites-enabled/00-default-ssl.conf
 sudo cp /root/read.conf.pre-1.1 /etc/nginx/sites-available/read.conf
 sudo cp /root/olpub.conf.pre-1.1 /etc/nginx/conf.d/olpub.conf
 sudo nginx -t && sudo systemctl reload nginx
@@ -274,5 +361,5 @@ nc -zv -w 3 10.0.30.57 8081
 | 3.1 | VM 1007: `Nginx tĩnh 8080, Python 8081/8082` (thay "olpub publisher 8080/8081/8082") |
 | 4.3 | VLAN 30: thêm `olpub -> NTP` |
 | 4.4 | Block VMID 1007: `policy_out: DROP` — VM tenant đầu tiên siết chiều ra, đúng ghi chú `policy_out` của mục 4.4. Sửa ghi chú về ký tự `\|` (rule đang tắt, không phải lỗi) |
-| 5.1 | Thêm `00-default-ssl.conf` (`ssl_reject_handshake`). Dòng `read` → `http://10.0.30.57:8080` là **Nginx tĩnh** |
+| 5.1 | Dòng `read` → `http://10.0.30.57:8080` là **Nginx tĩnh**. Ghi rõ `00-default-redirect.conf` có cả server 443 `default_server` + `ssl_reject_handshake` (tài liệu hiện chỉ mô tả cổng 80) |
 | 8 | Thêm rủi ro: VM 1007 cập nhật gói thủ công vì không có Internet |

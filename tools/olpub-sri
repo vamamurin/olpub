@@ -1,0 +1,55 @@
+#!/bin/sh
+# olpub-sri — quản lý mã băm SRI của button.js trên Nginx VM 100.
+# Cài: sudo install -m 755 olpub-sri /usr/local/sbin/olpub-sri
+#
+#   olpub-sri hash <file>   In mã băm của một file button.js (chạy ở bất cứ máy nào có file gốc)
+#   olpub-sri show          In mã băm Nginx đang ghim
+#   olpub-sri set <mã băm>  Ghi mã băm mới, nginx -t, reload (tự hoàn tác nếu nginx -t lỗi)
+#   olpub-sri check         So mã băm đang ghim với file VM 1007 đang trả (chỉ để KIỂM TRA)
+#
+# Nguyên tắc: mã băm phải tính từ bản button.js bạn TIN (bản bạn vừa sửa và chép sang VM 1007),
+# không tính từ file tải về từ VM 1007 — nếu VM 1007 đã bị chiếm, tải về là tải bản độc.
+set -eu
+CONF="${OLPUB_SRI_CONF:-/etc/nginx/conf.d/olpub.conf}"
+UPSTREAM="${OLPUB_SRI_UPSTREAM:-http://10.0.30.57:8082/_pub/button.js}"
+RE='sha384-[A-Za-z0-9+/]{64}'
+
+current() { grep -Eo "\"$RE\";[[:space:]]*# olpub-button-sri" "$CONF" | grep -Eo "$RE"; }
+
+case "${1:-}" in
+  hash)
+    [ -f "${2:-}" ] || { echo "Dùng: olpub-sri hash <đường dẫn button.js>" >&2; exit 2; }
+    printf 'sha384-%s\n' "$(openssl dgst -sha384 -binary "$2" | openssl base64 -A)" ;;
+  show)
+    current ;;
+  set)
+    NEW="${2:-}"
+    echo "$NEW" | grep -Eqx "$RE" || { echo "Mã băm không hợp lệ (cần dạng sha384-<64 ký tự base64>)" >&2; exit 2; }
+    [ "$(id -u)" = 0 ] || { echo "Cần sudo" >&2; exit 1; }
+    OLD="$(current)" || { echo "Không tìm thấy dòng '# olpub-button-sri' trong $CONF" >&2; exit 1; }
+    cp -p "$CONF" "$CONF.sri-bak"
+    sed -i -E "s|\"$RE\";([[:space:]]*# olpub-button-sri)|\"$NEW\";\1|" "$CONF"
+    if nginx -t 2>/dev/null; then
+      systemctl reload nginx
+      rm -f "$CONF.sri-bak"
+      echo "Đã ghim: $NEW"
+      echo "(cũ:     $OLD)"
+    else
+      mv "$CONF.sri-bak" "$CONF"
+      echo "nginx -t lỗi — đã hoàn tác, giữ mã băm cũ" >&2
+      nginx -t; exit 1
+    fi ;;
+  check)
+    PINNED="$(current)"
+    SERVED="sha384-$(curl -fsS -m 10 -H 'X-Pub-User: olpub-sri-check' -H 'X-Pub-Device: olpub-sri-check' "$UPSTREAM" \
+                     | openssl dgst -sha384 -binary | openssl base64 -A)"
+    echo "Đang ghim : $PINNED"
+    echo "VM 1007 trả: $SERVED"
+    if [ "$PINNED" = "$SERVED" ]; then echo "KHỚP — nút hoạt động"
+    else echo "KHÔNG KHỚP — trình duyệt sẽ không chạy button.js (nút biến mất)."
+         echo "Nếu bạn vừa sửa button.js: tính mã băm từ bản bạn sửa rồi 'olpub-sri set'."
+         echo "Nếu KHÔNG ai sửa: file trên VM 1007 đã bị thay đổi — kiểm tra VM 1007."; exit 3
+    fi ;;
+  *)
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

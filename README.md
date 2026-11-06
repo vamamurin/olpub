@@ -7,11 +7,12 @@
 
 | Thư mục | Nội dung | Triển khai tới |
 |---|---|---|
-| `publisher/` | `olpub_publisher.py`, `static/`, unit systemd, env mẫu | VM 1007 `host-publish` |
+| `publisher/` | `olpub_publisher.py`, `static/` (`button.js` — nút trong editor, `read.css` — trang công khai), unit systemd, env mẫu | VM 1007 `host-publish` |
 | `proxmox/` | `1007.fw` — Proxmox Firewall VM 1007 (chặn đường ra Internet) | `pve-control` |
 | `collector/` | `olpub_collector.py`, unit systemd, env mẫu | VM 1006 (host, ngoài container) |
-| `nginx/` | `conf.d-olpub.conf`, `overleaf.conf` (mẫu), `read.conf`, `00-default-ssl.conf` | VM 100 `nginx-prod-01` |
+| `nginx/` | `conf.d-olpub.conf`, `overleaf.conf` (mẫu), `read.conf` | VM 100 `nginx-prod-01` |
 | `nginx/vm1007-*` | Nginx tĩnh + drop-in systemd | VM 1007 |
+| `tools/olpub-sri` | Quản lý mã băm SRI của `button.js` (hash / show / set / check) | VM 100 `/usr/local/sbin/` |
 | `tests/` | `e2e_test.py` — chạy thử trên máy bất kỳ có nginx, qpdf, exiftool, poppler-utils, reportlab, pikepdf, Pillow | — |
 
 Chỉ dùng thư viện chuẩn Python ≥ 3.11 (Debian 12), cộng với `qpdf`, `libimage-exiftool-perl`, `poppler-utils`; VM 1007 thêm `nginx`.
